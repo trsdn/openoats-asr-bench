@@ -1,0 +1,31 @@
+[project]
+name = "openoats-asr-bench"
+version = "0.1.0"
+description = "Side-by-side ASR benchmark harness for local open-weight models (Parakeet, Canary, Whisper) on OpenOats session audio."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    # Whisper-Large-v3 via CTranslate2 runtime — fast, Mac-friendly, no
+    # PyTorch dependency needed just for this one model.
+    "faster-whisper>=1.1.0",
+
+    # NVIDIA NeMo — runtime for Parakeet-TDT and Canary-1b-flash.
+    # Heavy install (~3 GB of deps incl. PyTorch) but it's the official
+    # path for both NVIDIA ASR families. MPS acceleration works on Apple
+    # Silicon for inference; falls back to CPU otherwise.
+    "nemo-toolkit[asr]>=2.0.0",
+
+    # Audio IO + conversion (CAF → WAV 16 kHz mono as all three models
+    # expect). soundfile reads CAF via libsndfile; ffmpeg is used as a
+    # fallback via pydub when soundfile can't read the variant.
+    "soundfile>=0.12",
+    "librosa>=0.10",
+    "numpy>=1.26",
+
+    # Report rendering
+    "rich>=13",
+]
+
+[tool.uv]
+# Keep models off ~/Library and ~/.cache so the 200+ GB download stays
+# on the external volume where this repo lives.
+env-file = ".env"

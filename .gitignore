@@ -1,0 +1,20 @@
+.venv/
+.env
+.env.local
+__pycache__/
+*.pyc
+*.egg-info/
+.ruff_cache/
+
+# Run outputs (transcripts, metrics, reports) — don't commit to the repo,
+# they can be hundreds of MB per run.
+runs/
+
+# Any audio the user drops here for ad-hoc testing.
+audio/
+*.caf
+*.wav
+*.mp3
+*.m4a
+
+.DS_Store
