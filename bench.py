@@ -181,47 +181,89 @@ def run_faster_whisper(audio: np.ndarray, model_name: str = "large-v3") -> str:
 
 
 def run_nemo_asr(audio: np.ndarray, model_id: str) -> str:
-    """Unified runner for Parakeet / Canary. Both use `nemo_toolkit.collections.asr`'s
-    `EncDecRNNTModel` / `EncDecMultiTaskModel` with a `.transcribe()` entry
-    point that accepts either audio file paths or raw numpy arrays."""
+    """Unified runner for Parakeet / Canary. Chunks the audio into short
+    windows and transcribes each one individually — NeMo's default
+    Lhotse dataloader fails on long audio with macOS's spawn-based
+    multiprocessing (the 8 default workers silently exit before producing
+    a single batch, leaving "Transcribing: 0it" in the log). Passing each
+    window as its own one-shot transcribe call sidesteps the dataloader
+    path entirely and keeps peak RAM bounded."""
     from nemo.collections.asr.models import ASRModel
-
-    # NeMo's .transcribe expects a list of file paths OR a list of numpy
-    # arrays (newer versions). We write a temp WAV to be safe across
-    # NeMo releases.
     import tempfile
 
     model = ASRModel.from_pretrained(model_id)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        sf.write(tmp.name, audio, TARGET_SR, subtype="PCM_16")
-        try:
-            result = model.transcribe([tmp.name], batch_size=1)
-        finally:
-            Path(tmp.name).unlink(missing_ok=True)
+    # Belt-and-braces: even if NeMo's transcribe() internally builds a
+    # dataloader, make sure any worker count is 0.
+    try:
+        model._cfg.test_ds.num_workers = 0
+    except Exception:
+        pass
+    try:
+        model._cfg.validation_ds.num_workers = 0
+    except Exception:
+        pass
 
-    # NeMo returns either list[str] or list[Hypothesis] depending on
-    # the model family. Normalise.
+    chunk_seconds = 30.0
+    chunk_samples = int(chunk_seconds * TARGET_SR)
+    n_chunks = max(1, (len(audio) + chunk_samples - 1) // chunk_samples)
+
     texts: list[str] = []
-    for r in result:
-        if isinstance(r, str):
-            texts.append(r)
-        elif hasattr(r, "text"):
-            texts.append(str(r.text))
-        elif isinstance(r, list) and r and hasattr(r[0], "text"):
-            # multi-hypothesis output, keep best
-            texts.append(str(r[0].text))
-        else:
-            texts.append(str(r))
-    del model
-    gc.collect()
+    tmpdir = Path(tempfile.mkdtemp(prefix="nemo-bench-"))
+    try:
+        for i in range(n_chunks):
+            start = i * chunk_samples
+            end = min(len(audio), start + chunk_samples)
+            segment = audio[start:end]
+            if len(segment) < TARGET_SR // 10:
+                # Skip anything shorter than 100 ms — NeMo occasionally
+                # errors on micro-chunks at the end of the file.
+                continue
+            wav_path = tmpdir / f"chunk_{i:05d}.wav"
+            sf.write(str(wav_path), segment, TARGET_SR, subtype="PCM_16")
+            try:
+                result = model.transcribe(
+                    [str(wav_path)],
+                    batch_size=1,
+                    num_workers=0,
+                    verbose=False,
+                )
+            except TypeError:
+                # Older NeMo versions don't accept num_workers/verbose kwargs.
+                result = model.transcribe([str(wav_path)], batch_size=1)
+            finally:
+                wav_path.unlink(missing_ok=True)
+
+            # NeMo returns list[str] or list[Hypothesis] depending on
+            # the model family + version. Normalise.
+            for r in result:
+                if isinstance(r, str):
+                    texts.append(r)
+                elif hasattr(r, "text"):
+                    texts.append(str(r.text))
+                elif isinstance(r, list) and r and hasattr(r[0], "text"):
+                    texts.append(str(r[0].text))
+                else:
+                    texts.append(str(r))
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        del model
+        gc.collect()
+
     return " ".join(t.strip() for t in texts).strip()
 
 
 MODEL_REGISTRY: dict[str, dict] = {
-    "parakeet": {
-        "kind": "nemo",
-        "nemo_id": "nvidia/parakeet-tdt-1.1b",
-        "label": "NVIDIA Parakeet-TDT 1.1B (CTC, English-focused)",
+    "parakeet-live": {
+        # Reads OpenOats's own transcript.live.jsonl — the Parakeet v3
+        # output the user actually sees in production. Avoids having to
+        # reproduce the FluidAudio / Swift pipeline in Python (NeMo's
+        # EncDecRNNTBPE wrapper for parakeet-tdt-0.6b-v3 multilingual
+        # decoded to 0 tokens on our test audio). This is also a
+        # "truer" comparison target: it's literally the output the
+        # user is comparing Whisper / Canary against.
+        "kind": "openoats_live",
+        "label": "OpenOats live Parakeet-TDT v3 (as produced by the app)",
     },
     "canary": {
         "kind": "nemo",
@@ -236,7 +278,61 @@ MODEL_REGISTRY: dict[str, dict] = {
 }
 
 
-def run_model(model_key: str, audio: np.ndarray) -> tuple[str, str | None]:
+def run_openoats_live(session_dir: Path, channel: str) -> str:
+    """Extract the Parakeet-v3 output from OpenOats's own
+    `transcript.live.jsonl` and split it by speaker so we can line it up
+    against model output for the `mic` vs `sys` channels separately.
+
+    `.you` speaker records map to the mic channel, everything else
+    (`.them` / `.remote(…)`) maps to sys. If the preferred file name is
+    missing we fall back to the `.pre-cleanup.bak` copy the app writes
+    at finalize time."""
+    import json
+
+    candidates = [
+        session_dir / "transcript.live.jsonl",
+        session_dir / "transcript.live.jsonl.pre-cleanup.bak",
+    ]
+    jsonl_path = next((p for p in candidates if p.exists()), None)
+    if jsonl_path is None:
+        raise FileNotFoundError(
+            f"No transcript.live.jsonl (or .bak) under {session_dir}"
+        )
+
+    mic_parts: list[str] = []
+    sys_parts: list[str] = []
+    for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        speaker = rec.get("speaker")
+        # Speaker is serialised as either "you" or a dict like
+        # {"them": null} / {"remote": 1} depending on OpenOats version.
+        if speaker == "you" or (isinstance(speaker, dict) and "you" in speaker):
+            is_mic = True
+        else:
+            is_mic = False
+        # Prefer the cleaned / refined text (`refinedText`) over the raw
+        # `text` — that's what the UI shows.
+        text = rec.get("refinedText") or rec.get("text") or ""
+        text = text.strip()
+        if not text:
+            continue
+        (mic_parts if is_mic else sys_parts).append(text)
+
+    return " ".join(mic_parts if channel == "mic" else sys_parts).strip()
+
+
+def run_model(
+    model_key: str,
+    audio: np.ndarray,
+    session_dir: Path,
+    channel: str,
+) -> tuple[str, str | None]:
     """Dispatch on the registry. Returns (text, error). Any exception is
     caught so one broken runtime doesn't kill the rest of the matrix."""
     cfg = MODEL_REGISTRY[model_key]
@@ -245,6 +341,8 @@ def run_model(model_key: str, audio: np.ndarray) -> tuple[str, str | None]:
             return run_faster_whisper(audio, cfg["fw_id"]), None
         elif cfg["kind"] == "nemo":
             return run_nemo_asr(audio, cfg["nemo_id"]), None
+        elif cfg["kind"] == "openoats_live":
+            return run_openoats_live(session_dir, channel), None
         else:
             raise ValueError(f"Unknown kind: {cfg['kind']}")
     except Exception as exc:
@@ -317,7 +415,7 @@ def main() -> int:
             console.print(f"\n[bold magenta]▶ {model_key} / {ch}[/bold magenta]")
             start = time.perf_counter()
             rss_before = peak_rss_mb()
-            text, err = run_model(model_key, audio)
+            text, err = run_model(model_key, audio, session_dir, ch)
             wall = time.perf_counter() - start
             rss_after = peak_rss_mb()
 
