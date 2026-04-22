@@ -180,17 +180,25 @@ def run_faster_whisper(audio: np.ndarray, model_name: str = "large-v3") -> str:
     return " ".join(chunks).strip()
 
 
-def run_nemo_asr(audio: np.ndarray, model_id: str) -> str:
+def run_nemo_asr(
+    audio: np.ndarray,
+    model_id: str,
+    extra_transcribe_kwargs: dict | None = None,
+) -> str:
     """Unified runner for Parakeet / Canary. Chunks the audio into short
     windows and transcribes each one individually — NeMo's default
     Lhotse dataloader fails on long audio with macOS's spawn-based
     multiprocessing (the 8 default workers silently exit before producing
     a single batch, leaving "Transcribing: 0it" in the log). Passing each
     window as its own one-shot transcribe call sidesteps the dataloader
-    path entirely and keeps peak RAM bounded."""
+    path entirely and keeps peak RAM bounded.
+
+    `extra_transcribe_kwargs` is merged into `transcribe()` — used for
+    Canary's `source_lang`/`target_lang`/`pnc`/`task` hints."""
     from nemo.collections.asr.models import ASRModel
     import tempfile
 
+    extra_kwargs = dict(extra_transcribe_kwargs or {})
     model = ASRModel.from_pretrained(model_id)
     # Belt-and-braces: even if NeMo's transcribe() internally builds a
     # dataloader, make sure any worker count is 0.
@@ -226,10 +234,17 @@ def run_nemo_asr(audio: np.ndarray, model_id: str) -> str:
                     batch_size=1,
                     num_workers=0,
                     verbose=False,
+                    **extra_kwargs,
                 )
             except TypeError:
                 # Older NeMo versions don't accept num_workers/verbose kwargs.
-                result = model.transcribe([str(wav_path)], batch_size=1)
+                # Still try with the model-specific extras (Canary's
+                # source_lang/target_lang are required, not optional).
+                result = model.transcribe(
+                    [str(wav_path)],
+                    batch_size=1,
+                    **extra_kwargs,
+                )
             finally:
                 wav_path.unlink(missing_ok=True)
 
@@ -269,6 +284,19 @@ MODEL_REGISTRY: dict[str, dict] = {
         "kind": "nemo",
         "nemo_id": "nvidia/canary-1b-flash",
         "label": "NVIDIA Canary-1B-Flash (multilingual: en/de/fr/es)",
+        # Canary is a Multi-Task model: without explicit language hints
+        # it auto-translates to English. For an honest ASR comparison on
+        # DE meetings we pin both source+target to German and request
+        # punctuation+capitalisation. Mixed-language utterances are a
+        # known weakness of this config — live Parakeet handles code-
+        # switching better, but this is the cleanest Canary-on-German
+        # baseline for the benchmark.
+        "nemo_transcribe_kwargs": {
+            "source_lang": "de",
+            "target_lang": "de",
+            "pnc": "yes",
+            "task": "asr",
+        },
     },
     "whisper-large-v3": {
         "kind": "whisper",
@@ -340,7 +368,11 @@ def run_model(
         if cfg["kind"] == "whisper":
             return run_faster_whisper(audio, cfg["fw_id"]), None
         elif cfg["kind"] == "nemo":
-            return run_nemo_asr(audio, cfg["nemo_id"]), None
+            return run_nemo_asr(
+                audio,
+                cfg["nemo_id"],
+                extra_transcribe_kwargs=cfg.get("nemo_transcribe_kwargs"),
+            ), None
         elif cfg["kind"] == "openoats_live":
             return run_openoats_live(session_dir, channel), None
         else:
