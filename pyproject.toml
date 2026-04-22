@@ -25,7 +25,6 @@ dependencies = [
     "rich>=13",
 ]
 
-[tool.uv]
-# Keep models off ~/Library and ~/.cache so the 200+ GB download stays
-# on the external volume where this repo lives.
-env-file = ".env"
+# bench.py loads the .env manually at import time so `uv run` keeps
+# the cache redirection even when invoked ad-hoc without a shell that
+# sources .env first. No uv-side env-file wiring needed.

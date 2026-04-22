@@ -74,19 +74,59 @@ TARGET_SR = 16_000
 
 
 def load_mono_16k(path: Path) -> np.ndarray:
-    """Read `path` (any format libsndfile understands — CAF included on
-    macOS), downmix to mono, resample to 16 kHz. Returns float32 array
-    normalised to [-1, 1]."""
-    audio, sr = sf.read(str(path), dtype="float32", always_2d=True)
-    # mix down
-    if audio.shape[1] > 1:
-        audio = audio.mean(axis=1)
-    else:
-        audio = audio[:, 0]
+    """Read `path`, downmix to mono, resample to 16 kHz. Returns float32
+    in [-1, 1].
+
+    First tries libsndfile (via soundfile); some CAF variants written by
+    AVAudioFile aren't parseable there, so we fall back to ffmpeg which
+    handles every CAF codec in the wild. ffmpeg is a hard runtime
+    dependency — install via `brew install ffmpeg` on macOS."""
+    try:
+        audio, sr = sf.read(str(path), dtype="float32", always_2d=True)
+        if audio.shape[1] > 1:
+            audio = audio.mean(axis=1)
+        else:
+            audio = audio[:, 0]
+    except Exception as libsnd_err:
+        audio, sr = _ffmpeg_decode(path)
+        if audio is None:
+            raise RuntimeError(
+                f"Could not decode {path} via soundfile or ffmpeg: {libsnd_err}"
+            )
     if sr != TARGET_SR:
         import librosa  # lazy — librosa pulls in scipy etc.
         audio = librosa.resample(audio, orig_sr=sr, target_sr=TARGET_SR)
     return audio.astype(np.float32, copy=False)
+
+
+def _ffmpeg_decode(path: Path) -> tuple[np.ndarray | None, int]:
+    """Decode `path` to mono float32 16 kHz via a single ffmpeg subprocess
+    call. Returns (samples, sample_rate) or (None, 0) on failure."""
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return None, 0
+
+    cmd = [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", str(path),
+        "-ac", "1",             # downmix to mono
+        "-ar", str(TARGET_SR),  # resample to 16 kHz
+        "-f", "f32le",          # raw float32 little-endian
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        print(f"[ffmpeg] failed: {exc.stderr.decode(errors='replace')}", file=sys.stderr)
+        return None, 0
+    samples = np.frombuffer(proc.stdout, dtype=np.float32)
+    return samples, TARGET_SR
 
 
 # ──────────────────────────────────────────────
